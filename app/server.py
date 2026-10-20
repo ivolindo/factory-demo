@@ -9,7 +9,7 @@ import sqlite3
 import subprocess
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import date as calendar_date, datetime, timezone
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
@@ -48,6 +48,7 @@ def build_id() -> str | None:
 MAX_AUTHOR = 32
 AUTHOR = re.compile(rf"[A-Za-z0-9_-]{{1,{MAX_AUTHOR}}}")
 MAX_TEXT = 280
+DAY = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 
 
 class BadRequest(Exception):
@@ -87,6 +88,17 @@ def parse_blocked(body: bytes) -> bool:
     if not isinstance(blocked, bool):
         raise BadRequest("blocked", "blocked must be true or false")
     return blocked
+
+
+def parse_day(value: str) -> str:
+    refused = BadRequest("date", "date must be a real calendar date written YYYY-MM-DD")
+    # fromisoformat alone also accepts compact forms such as "20261020".
+    if not DAY.fullmatch(value):
+        raise refused
+    try:
+        return calendar_date.fromisoformat(value).isoformat()
+    except ValueError:
+        raise refused from None
 
 
 def require_content_length(request: Request) -> None:
@@ -165,14 +177,19 @@ def create_app(store: NoteStore) -> FastAPI:
     # The store's SQLite connection belongs to the thread that opened it, so every
     # route that touches the store is async and runs on the server's own thread.
     @app.get("/notes")
-    async def board() -> dict:
-        date = today()
+    async def board(request: Request) -> JSONResponse:
+        # Read the raw query so that `?date=` (empty) is refused rather than taken as absent.
+        requested = request.query_params.get("date")
+        try:
+            date = today() if requested is None else parse_day(requested)
+        except BadRequest as exc:
+            return JSONResponse(refusal(exc.field, str(exc)), status_code=HTTPStatus.BAD_REQUEST)
         notes = store.board(date)
-        return {
+        return JSONResponse({
             "date": date,
             "notes": [note.to_json() for note in notes],
             "blocked_count": sum(note.blocked for note in notes),
-        }
+        })
 
     @app.post("/notes")
     async def post_note(request: Request) -> JSONResponse:
