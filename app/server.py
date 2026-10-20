@@ -177,16 +177,14 @@ def create_app(store: NoteStore) -> FastAPI:
     # The store's SQLite connection belongs to the thread that opened it, so every
     # route that touches the store is async and runs on the server's own thread.
     @app.get("/notes")
-    async def board(request: Request) -> JSONResponse:
-        # Read the raw query so that `?date=` (empty) is refused rather than taken as absent.
-        requested = request.query_params.get("date")
+    async def board(date: str | None = None) -> JSONResponse:
         try:
-            date = today() if requested is None else parse_day(requested)
+            day = today() if date is None else parse_day(date)
         except BadRequest as exc:
             return JSONResponse(refusal(exc.field, str(exc)), status_code=HTTPStatus.BAD_REQUEST)
-        notes = store.board(date)
+        notes = store.board(day)
         return JSONResponse({
-            "date": date,
+            "date": day,
             "notes": [note.to_json() for note in notes],
             "blocked_count": sum(note.blocked for note in notes),
         })
