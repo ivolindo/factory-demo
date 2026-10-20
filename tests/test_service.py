@@ -6,7 +6,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -27,10 +27,10 @@ def seed(db_path, *notes: tuple[str, str, int, str]) -> None:
         conn.close()
 
 
-def post_with_length(service, length: str, body: bytes):
+def post_with_length(service, length: str, body: bytes, path: str = "/notes"):
     conn = http.client.HTTPConnection("127.0.0.1", service.port, timeout=5)
     try:
-        conn.putrequest("POST", "/notes")
+        conn.putrequest("POST", path)
         conn.putheader("Content-Length", length)
         conn.endheaders(body)
         resp = conn.getresponse()
@@ -230,6 +230,106 @@ def test_a_store_failure_is_a_500_with_error(service, db_path):
     status, body = service.post_json("/notes", {"author": "oleg", "text": "shipping"})
     assert status == 500
     assert isinstance(body["error"], str)
+
+
+def post_note(service, author: str, text: str = "working on it") -> dict:
+    return service.post_json("/notes", {"author": author, "text": text})[1]
+
+
+def flag(service, note_id, blocked):
+    return service.post_json(f"/notes/{note_id}/blocked", {"blocked": blocked})
+
+
+def flags(service) -> tuple[list[tuple[str, bool]], int]:
+    _, board = service.get_json("/notes")
+    return [(n["author"], n["blocked"]) for n in board["notes"]], board["blocked_count"]
+
+
+def test_blocking_a_note_flags_only_that_note(service):
+    post_note(service, "oleg")
+    dana = post_note(service, "dana", "waiting on the API key")
+    status, body = flag(service, dana["id"], True)
+    assert status == 200
+    assert body == {"id": dana["id"], "author": "dana", "text": "waiting on the API key",
+                    "blocked": True, "date": today()}
+    assert flags(service) == ([("dana", True), ("oleg", False)], 1)
+
+
+def test_unblocking_a_note_clears_the_flag(service):
+    dana = post_note(service, "dana")
+    flag(service, dana["id"], True)
+    status, body = flag(service, dana["id"], False)
+    assert (status, body["blocked"]) == (200, False)
+    assert flags(service) == ([("dana", False)], 0)
+
+
+def test_flags_follow_the_last_change_to_each_note(service):
+    post_note(service, "ana")
+    ben, cleo = post_note(service, "ben"), post_note(service, "cleo")
+    flag(service, ben["id"], True)
+    flag(service, ben["id"], False)
+    flag(service, cleo["id"], True)
+    assert flags(service) == ([("ana", False), ("ben", False), ("cleo", True)], 1)
+
+
+def test_a_same_day_repost_keeps_the_blocked_flag(service):
+    old = post_note(service, "ana", "old")
+    flag(service, old["id"], True)
+    new = post_note(service, "ana", "new")
+    assert (new["status"], new["id"], new["blocked"]) == ("updated", old["id"], True)
+    _, board = service.get_json("/notes")
+    assert [(n["text"], n["blocked"]) for n in board["notes"]] == [("new", True)]
+    assert board["blocked_count"] == 1
+
+
+@pytest.mark.parametrize("note_id", ["999999", "abc", "1.5", "-1", str(2**63)])
+def test_flagging_an_unknown_note_is_404_with_error(service, note_id):
+    post_note(service, "oleg")
+    status, body = flag(service, note_id, True)
+    assert status == 404
+    assert isinstance(body["error"], str)
+    assert flags(service) == ([("oleg", False)], 0)
+
+
+@pytest.mark.parametrize("payload", [{"blocked": "yes"}, {"blocked": 1}, {"blocked": None}, {}])
+def test_a_flag_that_is_not_a_boolean_is_refused(service, payload):
+    dana = post_note(service, "dana")
+    flag(service, dana["id"], True)
+    status, body = service.post_json(f"/notes/{dana['id']}/blocked", payload)
+    assert_refused(status, body, "blocked")
+    assert flags(service) == ([("dana", True)], 1)
+
+
+@pytest.mark.parametrize("raw", [b"not json", b"[true]", b"true"])
+def test_a_flag_body_that_is_not_a_json_object_is_refused(service, raw):
+    dana = post_note(service, "dana")
+    status, body = post_with_length(service, str(len(raw)), raw, f"/notes/{dana['id']}/blocked")
+    assert_refused(status, body, "body")
+    assert flags(service) == ([("dana", False)], 0)
+
+
+def test_flagging_a_note_from_another_day_is_409(service, db_path):
+    yesterday = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
+    seed(db_path, ("oleg", "yesterday's work", 0, yesterday))
+    conn = sqlite3.connect(db_path)
+    try:
+        (note_id,) = conn.execute("SELECT id FROM notes").fetchone()
+        status, body = flag(service, note_id, True)
+        assert status == 409
+        assert isinstance(body["error"], str)
+        assert conn.execute("SELECT blocked FROM notes WHERE id = ?", (note_id,)).fetchone() == (0,)
+    finally:
+        conn.close()
+
+
+def test_a_blocked_flag_survives_a_restart(service):
+    oleg, dana = post_note(service, "oleg"), post_note(service, "dana")
+    flag(service, dana["id"], True)
+    service.restart()
+    _, board = service.get_json("/notes")
+    assert [(n["author"], n["id"], n["blocked"]) for n in board["notes"]] == [
+        ("dana", dana["id"], True), ("oleg", oleg["id"], False)]
+    assert board["blocked_count"] == 1
 
 
 def test_unknown_path_is_404_with_error(service):

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS notes (
@@ -14,6 +14,15 @@ CREATE TABLE IF NOT EXISTS notes (
     UNIQUE (author, date)
 )
 """
+MAX_ID = 2**63 - 1  # SQLite's largest INTEGER; a larger Python int cannot be bound at all.
+
+
+class NoteNotFound(Exception):
+    pass
+
+
+class NotToday(Exception):
+    pass
 
 
 @dataclass(frozen=True)
@@ -62,6 +71,24 @@ class NoteStore:
                 (author, date),
             ).fetchone()
         return _note(row), created
+
+    def set_blocked(self, note_id: int, blocked: bool, date: str) -> Note:
+        """Set the blocked flag on note `note_id`, which must be dated `date`."""
+        if not 0 < note_id <= MAX_ID:
+            raise NoteNotFound(note_id)
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT id, author, text, blocked, date FROM notes WHERE id = ?",
+                (note_id,),
+            ).fetchone()
+            if row is None:
+                raise NoteNotFound(note_id)
+            note = _note(row)
+            if note.date != date:
+                raise NotToday(note.date)
+            self._conn.execute(
+                "UPDATE notes SET blocked = ? WHERE id = ?", (blocked, note_id))
+        return replace(note, blocked=blocked)
 
     def board(self, date: str) -> list[Note]:
         rows = self._conn.execute(
