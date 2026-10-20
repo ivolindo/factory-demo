@@ -132,8 +132,7 @@ def test_database_rejects_a_second_note_for_the_same_author_and_day(service, db_
 
 def test_post_without_a_body_is_refused(service):
     status, _, body = service.request("POST", "/notes")
-    assert status == 400
-    assert json.loads(body)["field"] == "body"
+    assert_refused(status, json.loads(body), "body")
 
 
 INVALID_NOTES = [
@@ -148,6 +147,7 @@ INVALID_NOTES = [
     ({"author": "", "text": ""}, "author"),
     ({"author": "oleg", "text": ""}, "text"),
     ({"author": "oleg", "text": "x" * 281}, "text"),
+    ({"author": "oleg", "text": "é" * 281}, "text"),
     ({"author": "oleg"}, "text"),
     ({"author": "oleg", "text": 5}, "text"),
     ({"author": "oleg", "text": None}, "text"),
@@ -173,11 +173,18 @@ def test_a_body_that_is_not_a_json_object_is_refused(service, raw):
     assert_refused(status, body, "body")
 
 
-@pytest.mark.parametrize("author, text", [("a" * 32, "x" * 280), ("a-b_9", "x")])
+@pytest.mark.parametrize("author, text", [("a" * 32, "x" * 280), ("oleg", "é" * 280),
+                                          ("a-b_9", "x")])
 def test_a_note_at_the_limits_is_accepted(service, author, text):
     status, body = service.post_json("/notes", {"author": author, "text": text})
     assert status == 201
     assert (body["author"], body["text"], body["status"]) == (author, text, "created")
+
+
+def test_a_text_with_a_lone_surrogate_is_refused(service):
+    raw = b'{"author": "oleg", "text": "\\ud800"}'
+    status, body = post_with_length(service, str(len(raw)), raw)
+    assert_refused(status, body, "text")
 
 
 def test_a_refused_replace_keeps_the_existing_note(service):
@@ -200,7 +207,7 @@ def test_refused_notes_write_nothing(service):
 @pytest.mark.parametrize("length", ["", "abc", "-1"])
 def test_post_with_an_unusable_content_length_is_refused(service, length):
     status, body = post_with_length(service, length, b"{}")
-    assert status == 400
+    assert_refused(status, body, "body")
     assert "Content-Length" in body["error"]
 
 

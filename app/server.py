@@ -45,7 +45,8 @@ def build_id() -> str | None:
     return result.stdout.strip() if result.returncode == 0 else None
 
 
-AUTHOR = re.compile(r"[A-Za-z0-9_-]{1,32}")
+MAX_AUTHOR = 32
+AUTHOR = re.compile(rf"[A-Za-z0-9_-]{{1,{MAX_AUTHOR}}}")
 MAX_TEXT = 280
 
 
@@ -64,9 +65,15 @@ def parse_note(body: bytes) -> tuple[str, str]:
         raise BadRequest("body", "body must be a JSON object")
     author, text = payload.get("author"), payload.get("text")
     if not isinstance(author, str) or not AUTHOR.fullmatch(author):
-        raise BadRequest("author", "author must be 1 to 32 letters, digits, dashes or underscores")
+        raise BadRequest(
+            "author", f"author must be 1 to {MAX_AUTHOR} letters, digits, dashes or underscores")
     if not isinstance(text, str) or not 1 <= len(text) <= MAX_TEXT:
         raise BadRequest("text", f"text must be a string of 1 to {MAX_TEXT} characters")
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        # JSON can spell a lone UTF-16 surrogate such as "\ud800", which SQLite cannot store.
+        raise BadRequest("text", "text must be valid Unicode") from None
     return author, text
 
 
@@ -76,7 +83,7 @@ def require_content_length(request: Request) -> None:
     except ValueError:
         length = -1
     if length < 0:
-        raise BadRequest("body", "Content-Length must be a non-negative integer")
+        raise BadRequest("body", "the body's Content-Length must be a non-negative integer")
 
 
 class JSONResponse(Response):
@@ -90,6 +97,11 @@ class JSONResponse(Response):
 
 def error(status: HTTPStatus, message: str) -> JSONResponse:
     return JSONResponse({"error": message}, status_code=status)
+
+
+def refusal(field: str, message: str) -> dict[str, str]:
+    """The body of every 400: what went wrong, and which of author, text or body it was."""
+    return {"error": message, "field": field}
 
 
 def request_target(request: Request) -> str:
@@ -156,8 +168,7 @@ def create_app(store: NoteStore) -> FastAPI:
             require_content_length(request)
             author, text = parse_note(await request.body())
         except BadRequest as exc:
-            return JSONResponse({"error": str(exc), "field": exc.field},
-                                status_code=HTTPStatus.BAD_REQUEST)
+            return JSONResponse(refusal(exc.field, str(exc)), status_code=HTTPStatus.BAD_REQUEST)
         note, created = store.post(author, text, today())
         return JSONResponse(
             {**note.to_json(), "status": "created" if created else "updated"},
@@ -177,9 +188,9 @@ class JSONErrorH11Protocol(H11Protocol):
     """
 
     def send_400_response(self, msg: str) -> None:
-        body = json.dumps({"error": "malformed HTTP request: check the request line, the "
-                                    "headers, and that Content-Length is a non-negative integer"}
-                          ).encode()
+        body = json.dumps(refusal("body", "malformed HTTP request: check the request line, the "
+                                          "headers, and that the body's Content-Length is a "
+                                          "non-negative integer")).encode()
         headers = [(b"content-type", b"application/json"),
                    (b"content-length", str(len(body)).encode()), (b"connection", b"close")]
         for event in (h11.Response(status_code=400, headers=headers, reason=b"Bad Request"),
