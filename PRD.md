@@ -68,3 +68,10 @@ Notes survive a restart of the service.
 
 A user can start the service, post two notes from two authors, mark one blocked,
 restart the service, and see both notes with exactly one blocked on today's board.
+
+## Repository layout the checks assume
+
+- Application code in `app/`, started with `python3 -m app --port <port>` or the
+  `PORT` environment variable. The SQLite path comes from `STANDUP_DB`.
+- Tests in `tests/`, run with `python3 -m pytest -q tests`.
+- The GitHub Actions job that runs the tests on pull requests is named `tests`.
