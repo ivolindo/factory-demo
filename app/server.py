@@ -21,7 +21,7 @@ from starlette.exceptions import HTTPException
 from starlette.requests import ClientDisconnect
 from uvicorn.protocols.http.h11_impl import H11Protocol
 
-from app.store import NoteStore
+from app.store import NoteNotFound, NoteStore, NotToday
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 log = logging.getLogger("uvicorn.error")
@@ -56,13 +56,18 @@ class BadRequest(Exception):
         self.field = field
 
 
-def parse_note(body: bytes) -> tuple[str, str]:
+def json_object(body: bytes) -> dict[str, Any]:
     try:
         payload = json.loads(body)
     except (ValueError, RecursionError):
         raise BadRequest("body", "body must be a JSON object") from None
     if not isinstance(payload, dict):
         raise BadRequest("body", "body must be a JSON object")
+    return payload
+
+
+def parse_note(body: bytes) -> tuple[str, str]:
+    payload = json_object(body)
     author, text = payload.get("author"), payload.get("text")
     if not isinstance(author, str) or not AUTHOR.fullmatch(author):
         raise BadRequest(
@@ -75,6 +80,13 @@ def parse_note(body: bytes) -> tuple[str, str]:
         # JSON can spell a lone UTF-16 surrogate such as "\ud800", which SQLite cannot store.
         raise BadRequest("text", "text must be valid Unicode") from None
     return author, text
+
+
+def parse_blocked(body: bytes) -> bool:
+    blocked = json_object(body).get("blocked")
+    if not isinstance(blocked, bool):
+        raise BadRequest("blocked", "blocked must be true or false")
+    return blocked
 
 
 def require_content_length(request: Request) -> None:
@@ -100,7 +112,7 @@ def error(status: HTTPStatus, message: str) -> JSONResponse:
 
 
 def refusal(field: str, message: str) -> dict[str, str]:
-    """The body of every 400: what went wrong, and which of author, text or body it was."""
+    """The body of every 400: what went wrong, and which field of the request it was."""
     return {"error": message, "field": field}
 
 
@@ -174,6 +186,23 @@ def create_app(store: NoteStore) -> FastAPI:
             {**note.to_json(), "status": "created" if created else "updated"},
             status_code=HTTPStatus.CREATED if created else HTTPStatus.OK,
         )
+
+    # A non-integer id matches no route, so it gets the routing miss's 404.
+    @app.post("/notes/{note_id:int}/blocked")
+    async def flag_blocked(note_id: int, request: Request) -> JSONResponse:
+        try:
+            require_content_length(request)
+            blocked = parse_blocked(await request.body())
+        except BadRequest as exc:
+            return JSONResponse(refusal(exc.field, str(exc)), status_code=HTTPStatus.BAD_REQUEST)
+        try:
+            note = store.set_blocked(note_id, blocked, today())
+        except NoteNotFound:
+            return error(HTTPStatus.NOT_FOUND, f"no note with id {note_id}")
+        except NotToday as exc:
+            return error(HTTPStatus.CONFLICT,
+                         f"note {note_id} is from {exc}; only today's notes can be flagged")
+        return JSONResponse(note.to_json())
 
     return app
 
