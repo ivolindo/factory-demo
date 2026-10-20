@@ -4,11 +4,13 @@
   "holdout": ".factory/holdout/HOLDOUT.md",
   "driver": "http",
   "http": {
-    "start": "",
+    "start": "python3 -m app --port {port}",
     "health_path": "/health",
-    "health_contains": "",
+    "health_contains": "\"ok\": true",
     "boot_timeout_s": 45,
-    "env": {}
+    "env": {
+      "STANDUP_DB": "{state}/standup.sqlite"
+    }
   },
   "cli": {
     "invoke": "",

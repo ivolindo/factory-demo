@@ -71,7 +71,6 @@ The factory may accept issues in these areas.
 
 ## Allowed evolutions
 
-- Swapping the web framework for another small one, if the routes and responses stay identical.
 - Adding tests, type hints, and docstrings freely.
 - Improving the optional HTML board page without adding a build step.
 
@@ -95,7 +94,6 @@ This runs on every change that touches runnable code, including ones that "seem 
 
 The factory may propose an answer to any of them, build against it, and record what it assumed. The merge is then held for a human.
 
-- **Q1** Which small web framework: the standard library `http.server`, or one dependency such as Flask or FastAPI?
 - **Q2** Should `GET /notes` for a date with no notes return an empty list with 200, or 404?
 - **Q3** Which timezone defines "today": UTC always, or a configurable one? The PRD says UTC.
 
@@ -106,6 +104,7 @@ The factory may propose an answer to any of them, build against it, and record w
 
 ## Decisions
 
+- 2026-10-20 **Which web framework?** FastAPI, served by uvicorn. Those two packages are the one allowed framework dependency; declare them in `requirements.txt`. The service must still start with `python3 -m app --port <port>` and keep every route and response shape unchanged.
 - 2026-10-20 **Which date format?** `YYYY-MM-DD`, UTC, as the PRD states.
 
 ## What the factory does NOT own -- permanently human
