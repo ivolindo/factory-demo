@@ -130,12 +130,71 @@ def test_database_rejects_a_second_note_for_the_same_author_and_day(service, db_
         conn.close()
 
 
-def test_post_without_a_json_object_is_refused(service):
-    status, _, _ = service.request("POST", "/notes")
+def test_post_without_a_body_is_refused(service):
+    status, _, body = service.request("POST", "/notes")
     assert status == 400
-    status, body = service.post_json("/notes", {"author": "oleg"})
+    assert json.loads(body)["field"] == "body"
+
+
+INVALID_NOTES = [
+    ({"author": "", "text": "x"}, "author"),
+    ({"author": "a" * 33, "text": "x"}, "author"),
+    ({"author": "o leg", "text": "x"}, "author"),
+    ({"author": "oleg!", "text": "x"}, "author"),
+    ({"author": "ølé", "text": "x"}, "author"),
+    ({"author": "oleg\n", "text": "x"}, "author"),
+    ({"author": None, "text": "x"}, "author"),
+    ({"text": "x"}, "author"),
+    ({"author": "", "text": ""}, "author"),
+    ({"author": "oleg", "text": ""}, "text"),
+    ({"author": "oleg", "text": "x" * 281}, "text"),
+    ({"author": "oleg"}, "text"),
+    ({"author": "oleg", "text": 5}, "text"),
+    ({"author": "oleg", "text": None}, "text"),
+]
+
+
+def assert_refused(status, body, field):
     assert status == 400
-    assert "text" in body["error"]
+    assert body["field"] == field
+    assert field in body["error"]
+
+
+@pytest.mark.parametrize("payload, field", INVALID_NOTES)
+def test_an_invalid_note_is_refused_naming_the_field(service, payload, field):
+    status, body = service.post_json("/notes", payload)
+    assert_refused(status, body, field)
+
+
+@pytest.mark.parametrize("raw", [b"not json", b"[1,2]", b'"oleg"', b"null",
+                                 pytest.param(b"[" * 100_000, id="deeply-nested")])
+def test_a_body_that_is_not_a_json_object_is_refused(service, raw):
+    status, body = post_with_length(service, str(len(raw)), raw)
+    assert_refused(status, body, "body")
+
+
+@pytest.mark.parametrize("author, text", [("a" * 32, "x" * 280), ("a-b_9", "x")])
+def test_a_note_at_the_limits_is_accepted(service, author, text):
+    status, body = service.post_json("/notes", {"author": author, "text": text})
+    assert status == 201
+    assert (body["author"], body["text"], body["status"]) == (author, text, "created")
+
+
+def test_a_refused_replace_keeps_the_existing_note(service):
+    service.post_json("/notes", {"author": "oleg", "text": "kept"})
+    status, body = service.post_json("/notes", {"author": "oleg", "text": "x" * 281})
+    assert_refused(status, body, "text")
+    _, board = service.get_json("/notes")
+    assert [(n["author"], n["text"]) for n in board["notes"]] == [("oleg", "kept")]
+
+
+def test_refused_notes_write_nothing(service):
+    for payload, _ in INVALID_NOTES:
+        assert service.post_json("/notes", payload)[0] == 400
+    for raw in (b"not json", b"[1,2]"):
+        assert post_with_length(service, str(len(raw)), raw)[0] == 400
+    _, board = service.get_json("/notes")
+    assert (board["notes"], board["blocked_count"]) == ([], 0)
 
 
 @pytest.mark.parametrize("length", ["", "abc", "-1"])

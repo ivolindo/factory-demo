@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
 import subprocess
 from collections.abc import AsyncIterator
@@ -44,21 +45,29 @@ def build_id() -> str | None:
     return result.stdout.strip() if result.returncode == 0 else None
 
 
+AUTHOR = re.compile(r"[A-Za-z0-9_-]{1,32}")
+MAX_TEXT = 280
+
+
 class BadRequest(Exception):
-    pass
+    def __init__(self, field: str, message: str) -> None:
+        super().__init__(message)
+        self.field = field
 
 
 def parse_note(body: bytes) -> tuple[str, str]:
     try:
         payload = json.loads(body)
-    except ValueError:
-        raise BadRequest("body must be a JSON object") from None
+    except (ValueError, RecursionError):
+        raise BadRequest("body", "body must be a JSON object") from None
     if not isinstance(payload, dict):
-        raise BadRequest("body must be a JSON object")
-    for field in ("author", "text"):
-        if not isinstance(payload.get(field), str):
-            raise BadRequest(f"{field} must be a string")
-    return payload["author"], payload["text"]
+        raise BadRequest("body", "body must be a JSON object")
+    author, text = payload.get("author"), payload.get("text")
+    if not isinstance(author, str) or not AUTHOR.fullmatch(author):
+        raise BadRequest("author", "author must be 1 to 32 letters, digits, dashes or underscores")
+    if not isinstance(text, str) or not 1 <= len(text) <= MAX_TEXT:
+        raise BadRequest("text", f"text must be a string of 1 to {MAX_TEXT} characters")
+    return author, text
 
 
 def require_content_length(request: Request) -> None:
@@ -67,7 +76,7 @@ def require_content_length(request: Request) -> None:
     except ValueError:
         length = -1
     if length < 0:
-        raise BadRequest("Content-Length must be a non-negative integer")
+        raise BadRequest("body", "Content-Length must be a non-negative integer")
 
 
 class JSONResponse(Response):
@@ -147,7 +156,8 @@ def create_app(store: NoteStore) -> FastAPI:
             require_content_length(request)
             author, text = parse_note(await request.body())
         except BadRequest as exc:
-            return error(HTTPStatus.BAD_REQUEST, str(exc))
+            return JSONResponse({"error": str(exc), "field": exc.field},
+                                status_code=HTTPStatus.BAD_REQUEST)
         note, created = store.post(author, text, today())
         return JSONResponse(
             {**note.to_json(), "status": "created" if created else "updated"},
