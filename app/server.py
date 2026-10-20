@@ -1,19 +1,29 @@
-"""HTTP routes, served by the standard library's http.server."""
+"""HTTP routes, served by FastAPI under uvicorn."""
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import subprocess
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from typing import Any
+
+import h11
+from fastapi import FastAPI, Request
+from fastapi.responses import PlainTextResponse, Response
+from starlette.exceptions import HTTPException
+from starlette.requests import ClientDisconnect
+from uvicorn.protocols.http.h11_impl import H11Protocol
 
 from app.store import NoteStore
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+log = logging.getLogger("uvicorn.error")
 
 
 def today() -> str:
@@ -51,85 +61,118 @@ def parse_note(body: bytes) -> tuple[str, str]:
     return payload["author"], payload["text"]
 
 
-class Handler(BaseHTTPRequestHandler):
-    server: "StandupServer"
-    # The server answers one connection at a time, so this bounds how long a
-    # client that stops sending can hold up every other request.
-    timeout = 2
+def require_content_length(request: Request) -> None:
+    try:
+        length = int(request.headers.get("content-length", ""))
+    except ValueError:
+        length = -1
+    if length < 0:
+        raise BadRequest("Content-Length must be a non-negative integer")
 
-    def do_GET(self) -> None:
-        path = urlsplit(self.path).path
-        if path == "/health":
-            self._send_json(HTTPStatus.OK, {"ok": True})
-        elif path == "/build-id":
-            identity = build_id()
-            if identity is None:
-                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR,
-                                {"error": "no build identity available"})
-            else:
-                self._send(HTTPStatus.OK, "text/plain; charset=utf-8", identity.encode())
-        elif path == "/notes":
-            date = today()
-            try:
-                notes = self.server.store.board(date)
-            except sqlite3.Error as error:
-                self._store_failed(error)
-                return
-            self._send_json(HTTPStatus.OK, {
-                "date": date,
-                "notes": [note.to_json() for note in notes],
-                "blocked_count": sum(note.blocked for note in notes),
-            })
-        else:
-            self._not_found()
 
-    def do_POST(self) -> None:
-        if urlsplit(self.path).path != "/notes":
-            self._not_found()
-            return
+class JSONResponse(Response):
+    """JSON rendered by json.dumps, so bodies read `{"ok": true}` like the rest of the API."""
+
+    media_type = "application/json"
+
+    def render(self, content: Any) -> bytes:
+        return json.dumps(content).encode()
+
+
+def error(status: HTTPStatus, message: str) -> JSONResponse:
+    return JSONResponse({"error": message}, status_code=status)
+
+
+def request_target(request: Request) -> str:
+    target = request.scope["raw_path"].decode("latin-1")
+    query = request.scope["query_string"].decode("latin-1")
+    return f"{target}?{query}" if query else target
+
+
+def create_app(store: NoteStore) -> FastAPI:
+    """The service's routes over `store`, which the app closes when the server shuts down."""
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        yield
+        store.close()
+
+    app = FastAPI(
+        lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None,
+        redirect_slashes=False, default_response_class=JSONResponse,
+    )
+
+    @app.exception_handler(HTTPException)
+    async def no_route(request: Request, _: HTTPException) -> JSONResponse:
+        # Every routing miss, including a known path with another method, is a 404.
+        return error(HTTPStatus.NOT_FOUND, f"no route for {request_target(request)}")
+
+    @app.exception_handler(ClientDisconnect)
+    async def client_left(_: Request, __: ClientDisconnect) -> Response:
+        # The client hung up before sending its whole body; nobody reads this reply.
+        return Response(status_code=HTTPStatus.BAD_REQUEST)
+
+    @app.exception_handler(sqlite3.Error)
+    async def store_failed(_: Request, exc: sqlite3.Error) -> JSONResponse:
+        log.error("store failed: %r", exc)
+        return error(HTTPStatus.INTERNAL_SERVER_ERROR, "the note store failed")
+
+    @app.get("/health")
+    async def health() -> dict:
+        return {"ok": True}
+
+    # A plain def runs in a worker thread, so the git lookup does not stall other requests.
+    @app.get("/build-id")
+    def build_identity() -> Response:
+        identity = build_id()
+        if identity is None:
+            return error(HTTPStatus.INTERNAL_SERVER_ERROR, "no build identity available")
+        return PlainTextResponse(identity)
+
+    # The store's SQLite connection belongs to the thread that opened it, so every
+    # route that touches the store is async and runs on the server's own thread.
+    @app.get("/notes")
+    async def board() -> dict:
+        date = today()
+        notes = store.board(date)
+        return {
+            "date": date,
+            "notes": [note.to_json() for note in notes],
+            "blocked_count": sum(note.blocked for note in notes),
+        }
+
+    @app.post("/notes")
+    async def post_note(request: Request) -> JSONResponse:
         try:
-            author, text = parse_note(self._read_body())
-        except BadRequest as error:
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
-            return
-        try:
-            note, created = self.server.store.post(author, text, today())
-        except sqlite3.Error as error:
-            self._store_failed(error)
-            return
-        self._send_json(
-            HTTPStatus.CREATED if created else HTTPStatus.OK,
+            require_content_length(request)
+            author, text = parse_note(await request.body())
+        except BadRequest as exc:
+            return error(HTTPStatus.BAD_REQUEST, str(exc))
+        note, created = store.post(author, text, today())
+        return JSONResponse(
             {**note.to_json(), "status": "created" if created else "updated"},
+            status_code=HTTPStatus.CREATED if created else HTTPStatus.OK,
         )
 
-    def _read_body(self) -> bytes:
-        try:
-            length = int(self.headers.get("Content-Length", ""))
-        except ValueError:
-            length = -1
-        if length < 0:
-            raise BadRequest("Content-Length must be a non-negative integer")
-        return self.rfile.read(length)
-
-    def _store_failed(self, error: sqlite3.Error) -> None:
-        self.log_error("store failed: %r", error)
-        self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "the note store failed"})
-
-    def _not_found(self) -> None:
-        self._send_json(HTTPStatus.NOT_FOUND, {"error": f"no route for {self.path}"})
-
-    def _send_json(self, status: HTTPStatus, payload: dict) -> None:
-        self._send(status, "application/json", json.dumps(payload).encode())
-
-    def _send(self, status: HTTPStatus, content_type: str, body: bytes) -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+    return app
 
 
-class StandupServer(HTTPServer):
-    def __init__(self, port: int, store: NoteStore) -> None:
-        super().__init__(("127.0.0.1", port), Handler)
-        self.store = store
+class JSONErrorH11Protocol(H11Protocol):
+    """uvicorn's h11 protocol, answering requests it cannot parse in the API's JSON shape.
+
+    uvicorn refuses a malformed request head, such as an empty, negative or
+    non-numeric Content-Length, before the app sees it, and its own reply is
+    plain text. send_400_response is uvicorn's hook for that reply; requirements.txt
+    pins the uvicorn version this override is written against.
+    """
+
+    def send_400_response(self, msg: str) -> None:
+        body = json.dumps({"error": "malformed HTTP request: check the request line, the "
+                                    "headers, and that Content-Length is a non-negative integer"}
+                          ).encode()
+        headers = [(b"content-type", b"application/json"),
+                   (b"content-length", str(len(body)).encode()), (b"connection", b"close")]
+        for event in (h11.Response(status_code=400, headers=headers, reason=b"Bad Request"),
+                      h11.Data(data=body), h11.EndOfMessage()):
+            self.transport.write(self.conn.send(event))
+        self.transport.close()
