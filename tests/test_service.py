@@ -17,6 +17,16 @@ def today() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 
+def seed(db_path, *notes: tuple[str, str, int, str]) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        with conn:
+            conn.executemany(
+                "INSERT INTO notes (author, text, blocked, date) VALUES (?, ?, ?, ?)", notes)
+    finally:
+        conn.close()
+
+
 def post_with_length(service, length: str, body: bytes):
     conn = http.client.HTTPConnection("127.0.0.1", service.port, timeout=5)
     try:
@@ -80,6 +90,24 @@ def test_board_lists_today_sorted_by_author(service):
     assert board["date"] == today()
     assert [n["author"] for n in board["notes"]] == ["dana", "oleg"]
     assert board["blocked_count"] == 0
+
+
+def test_board_shows_only_today_and_a_new_day_gets_a_new_note(service, db_path):
+    seed(db_path, ("oleg", "yesterday's work", 0, "2000-01-01"))
+    status, note = service.post_json("/notes", {"author": "oleg", "text": "today's work"})
+    assert status == 201
+    _, board = service.get_json("/notes")
+    assert [(n["id"], n["text"], n["date"]) for n in board["notes"]] == [
+        (note["id"], "today's work", today())]
+
+
+def test_board_counts_and_flags_blocked_notes(service, db_path):
+    seed(db_path, ("dana", "waiting on the API key", 1, today()),
+         ("oleg", "shipping the invoice fix", 0, today()))
+    _, board = service.get_json("/notes")
+    assert [(n["author"], n["blocked"]) for n in board["notes"]] == [
+        ("dana", True), ("oleg", False)]
+    assert board["blocked_count"] == 1
 
 
 def test_notes_survive_a_restart(service):
