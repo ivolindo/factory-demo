@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import http.client
+import json
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -12,6 +15,18 @@ from conftest import ROOT
 
 def today() -> str:
     return datetime.now(timezone.utc).date().isoformat()
+
+
+def post_with_length(service, length: str, body: bytes):
+    conn = http.client.HTTPConnection("127.0.0.1", service.port, timeout=5)
+    try:
+        conn.putrequest("POST", "/notes")
+        conn.putheader("Content-Length", length)
+        conn.endheaders(body)
+        resp = conn.getresponse()
+        return resp.status, json.loads(resp.read())
+    finally:
+        conn.close()
 
 
 def test_health_answers_on_port_argument(service):
@@ -93,6 +108,34 @@ def test_post_without_a_json_object_is_refused(service):
     status, body = service.post_json("/notes", {"author": "oleg"})
     assert status == 400
     assert "text" in body["error"]
+
+
+@pytest.mark.parametrize("length", ["", "abc", "-1"])
+def test_post_with_an_unusable_content_length_is_refused(service, length):
+    status, body = post_with_length(service, length, b"{}")
+    assert status == 400
+    assert "Content-Length" in body["error"]
+
+
+@pytest.mark.parametrize("stall", [b"", b"POST /notes HTTP/1.1\r\nContent-Length: 100\r\n\r\n{}"])
+def test_a_stalled_client_does_not_stop_the_service(service, stall):
+    with socket.create_connection(("127.0.0.1", service.port)) as stalled:
+        stalled.sendall(stall)
+        assert service.get_json("/health") == (200, {"ok": True})
+
+
+def test_a_store_failure_is_a_500_with_error(service, db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("DROP TABLE notes")
+    finally:
+        conn.close()
+    status, body = service.get_json("/notes")
+    assert status == 500
+    assert isinstance(body["error"], str)
+    status, body = service.post_json("/notes", {"author": "oleg", "text": "shipping"})
+    assert status == 500
+    assert isinstance(body["error"], str)
 
 
 def test_unknown_path_is_404_with_error(service):

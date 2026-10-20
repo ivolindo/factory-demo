@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -52,6 +53,9 @@ def parse_note(body: bytes) -> tuple[str, str]:
 
 class Handler(BaseHTTPRequestHandler):
     server: "StandupServer"
+    # The server answers one connection at a time, so this bounds how long a
+    # client that stops sending can hold up every other request.
+    timeout = 2
 
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
@@ -66,7 +70,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(HTTPStatus.OK, "text/plain; charset=utf-8", identity.encode())
         elif path == "/notes":
             date = today()
-            notes = self.server.store.board(date)
+            try:
+                notes = self.server.store.board(date)
+            except sqlite3.Error as error:
+                self._store_failed(error)
+                return
             self._send_json(HTTPStatus.OK, {
                 "date": date,
                 "notes": [note.to_json() for note in notes],
@@ -79,17 +87,33 @@ class Handler(BaseHTTPRequestHandler):
         if urlsplit(self.path).path != "/notes":
             self._not_found()
             return
-        length = int(self.headers.get("Content-Length") or 0)
         try:
-            author, text = parse_note(self.rfile.read(length))
+            author, text = parse_note(self._read_body())
         except BadRequest as error:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
             return
-        note, created = self.server.store.post(author, text, today())
+        try:
+            note, created = self.server.store.post(author, text, today())
+        except sqlite3.Error as error:
+            self._store_failed(error)
+            return
         self._send_json(
             HTTPStatus.CREATED if created else HTTPStatus.OK,
             {**note.to_json(), "status": "created" if created else "updated"},
         )
+
+    def _read_body(self) -> bytes:
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            length = -1
+        if length < 0:
+            raise BadRequest("Content-Length must be a non-negative integer")
+        return self.rfile.read(length)
+
+    def _store_failed(self, error: sqlite3.Error) -> None:
+        self.log_error("store failed: %r", error)
+        self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "the note store failed"})
 
     def _not_found(self) -> None:
         self._send_json(HTTPStatus.NOT_FOUND, {"error": f"no route for {self.path}"})
