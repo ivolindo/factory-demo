@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
 import pytest
 
@@ -108,6 +109,45 @@ def test_board_counts_and_flags_blocked_notes(service, db_path):
     assert [(n["author"], n["blocked"]) for n in board["notes"]] == [
         ("dana", True), ("oleg", False)]
     assert board["blocked_count"] == 1
+
+
+def test_a_day_with_no_notes_is_an_empty_board(service):
+    assert service.get_json("/notes?date=2026-01-01") == (
+        200, {"date": "2026-01-01", "notes": [], "blocked_count": 0})
+
+
+def test_a_dated_board_shows_only_that_day(service):
+    service.post_json("/notes", {"author": "ana", "text": "today's work"})
+    _, past = service.get_json("/notes?date=2026-01-01")
+    assert past["notes"] == []
+    _, board = service.get_json("/notes")
+    assert [n["author"] for n in board["notes"]] == ["ana"]
+
+
+def test_a_dated_board_lists_that_day_sorted_with_its_blocked_count(service, db_path):
+    seed(db_path, ("zed", "stuck on review", 1, "2026-10-01"),
+         ("amy", "writing docs", 0, "2026-10-01"),
+         ("bob", "another day", 1, "2026-10-02"))
+    status, board = service.get_json("/notes?date=2026-10-01")
+    assert status == 200
+    assert board["date"] == "2026-10-01"
+    assert [(n["author"], n["blocked"], n["date"]) for n in board["notes"]] == [
+        ("amy", False, "2026-10-01"), ("zed", True, "2026-10-01")]
+    assert board["blocked_count"] == 1
+
+
+def test_todays_date_gives_the_same_board_as_no_date(service, db_path):
+    seed(db_path, ("dana", "waiting on the API key", 1, today()),
+         ("oleg", "shipping the invoice fix", 0, today()))
+    assert service.get_json(f"/notes?date={today()}") == service.get_json("/notes")
+
+
+@pytest.mark.parametrize("value", ["2026-13-01", "2026-02-30", "20261020", "yesterday", "",
+                                   "2026-1-01", "2026-10-01T00:00", " 2026-10-01",
+                                   "\uff12\uff10\uff12\uff16-10-01"])
+def test_an_invalid_date_is_refused_naming_the_field(service, value):
+    status, body = service.get_json(f"/notes?date={quote(value)}")
+    assert_refused(status, body, "date")
 
 
 def test_notes_survive_a_restart(service):
