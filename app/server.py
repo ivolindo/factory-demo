@@ -1,6 +1,7 @@
 """HTTP routes, served by FastAPI under uvicorn."""
 from __future__ import annotations
 
+import html
 import json
 import logging
 import os
@@ -16,12 +17,12 @@ from typing import Any
 
 import h11
 from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse, Response
+from fastapi.responses import HTMLResponse, PlainTextResponse, Response
 from starlette.exceptions import HTTPException
 from starlette.requests import ClientDisconnect
 from uvicorn.protocols.http.h11_impl import H11Protocol
 
-from app.store import NoteNotFound, NoteStore, NotToday
+from app.store import Note, NoteNotFound, NoteStore, NotToday
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 log = logging.getLogger("uvicorn.error")
@@ -134,6 +135,19 @@ def request_target(request: Request) -> str:
     return f"{target}?{query}" if query else target
 
 
+def render_board(day: str, notes: list[Note]) -> str:
+    """Today's board as a self-contained page: no script, no external asset, every value escaped."""
+    entries = "\n".join(
+        f"<li>{html.escape(note.author)}: {html.escape(note.text)}"
+        f"{' BLOCKED' if note.blocked else ''}</li>"
+        for note in notes)
+    return (
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+        f"<title>Board {day}</title>\n</head>\n<body>\n<h1>{day}</h1>\n"
+        f"<p>Blocked: {sum(note.blocked for note in notes)}</p>\n<ul>\n{entries}\n</ul>\n"
+        "</body>\n</html>\n")
+
+
 def create_app(store: NoteStore) -> FastAPI:
     """The service's routes over `store`, which the app closes when the server shuts down."""
 
@@ -188,6 +202,11 @@ def create_app(store: NoteStore) -> FastAPI:
             "notes": [note.to_json() for note in notes],
             "blocked_count": sum(note.blocked for note in notes),
         })
+
+    @app.get("/")
+    async def page() -> HTMLResponse:
+        day = today()
+        return HTMLResponse(render_board(day, store.board(day)))
 
     @app.post("/notes")
     async def post_note(request: Request) -> JSONResponse:

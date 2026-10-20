@@ -391,3 +391,38 @@ def test_missing_port_exits_with_message(base_env):
                             capture_output=True, text=True, timeout=10)
     assert result.returncode != 0
     assert "PORT" in result.stderr
+
+
+def test_the_page_shows_an_empty_board_for_today(service):
+    status, content_type, body = service.request("GET", "/")
+    assert (status, content_type) == (200, "text/html")
+    assert today() in body
+    assert "Blocked: 0" in body
+
+
+def test_the_page_lists_notes_in_author_order(service):
+    post_note(service, "oleg", "shipping the invoice fix")
+    post_note(service, "dana", "waiting on the API key")
+    _, _, body = service.request("GET", "/")
+    assert "shipping the invoice fix" in body
+    assert body.index("dana") < body.index("oleg")
+
+
+def test_the_page_marks_each_blocked_note_once(service, db_path):
+    post_note(service, "oleg")
+    post_note(service, "dana")
+    conn = sqlite3.connect(db_path)
+    with conn:
+        conn.execute("UPDATE notes SET blocked = 1 WHERE author = 'dana'")
+    conn.close()
+    _, _, body = service.request("GET", "/")
+    assert "Blocked: 1" in body
+    assert body.count("BLOCKED") == 1
+
+
+def test_the_page_escapes_note_text_and_loads_nothing(service):
+    post_note(service, "oleg", "<script>alert(1)</script>")
+    _, _, body = service.request("GET", "/")
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in body
+    assert "<script" not in body
+    assert "http://" not in body and "https://" not in body
